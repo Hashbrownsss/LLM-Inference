@@ -2,7 +2,7 @@
 
 An intelligent LLM inference server that routes requests to the optimal model based on request complexity — minimizing cost-per-correct-answer.
 
-> **Why this project?** vLLM optimizes for throughput. We optimize for cost-per-correct-answer. These are fundamentally different objectives. [Read the design document](design/DESIGN.md)
+> **Why this project?** vLLM optimizes for throughput. I'm trying to optimize for cost-per-correct-answer. These are fundamentally different objectives. [Read the design document](design/DESIGN.md)
 
 ## Quick Start
 
@@ -58,20 +58,6 @@ Router + Dynamic Batcher
      ▼
 Observability Dashboard
 ```
-
-## Day-by-Day Progress
-
-- [x] **Day 1**: Mental model (autoregressive generation, KV cache, memory bottleneck)
-- [x] **Day 1**: Project structure, FastAPI server skeleton, model pool
-- [ ] **Day 2**: Request batching — static + dynamic with max_wait_time
-- [ ] **Day 3**: FastAPI integration with model pool
-- [ ] **Day 4**: Request classifier (heuristic-based complexity detection)
-- [ ] **Day 5**: Router — route requests to appropriate model
-- [ ] **Day 6**: KV cache management — block-based allocator
-- [ ] **Day 7**: First benchmark run
-- [ ] **Day 10**: Observability dashboard
-- [ ] **Day 12**: Blog post + documentation
-
 ## Running Experiments
 
 ```python
@@ -97,7 +83,7 @@ asyncio.run(benchmark())
 
 ## Benchmark Results
 
-*To be filled after Day 7 experiments.*
+*yet to be filled*
 
 ## What I'm Learning
 
@@ -105,8 +91,3 @@ asyncio.run(benchmark())
 
 See [DESIGN.md](design/DESIGN.md) for detailed reasoning behind every decision.
 
-## Target Programs
-
-- CERN Short-Term Internship (Jan 2027)
-- OpenAI / HuggingFace / Meta AI Residency
-- Big Tech Inference Engineering (Meta FASTER, NVIDIA SDK, Anthropic)
