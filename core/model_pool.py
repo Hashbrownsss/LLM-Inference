@@ -22,10 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor
 
-# Import our model size enum
-import sys
-sys.path.insert(0, ".")
-from api.server import ModelSize
+from core.types import ModelSize
 
 
 @dataclass
@@ -117,6 +114,9 @@ class ModelPool:
         self._tokenizers: dict[ModelSize, Any] = {}
         self._metrics: dict[ModelSize, ModelMetrics] = {
             size: ModelMetrics() for size in ModelSize
+        }
+        self._pending_queue: dict[ModelSize, int] = {
+            size: 0 for size in ModelSize
         }
         self._load_lock = asyncio.Lock()
         self._is_initialized = False
@@ -286,6 +286,130 @@ class ModelPool:
         result["latency_ms"] = latency_ms
         return result
 
+    async def generate_batch(
+        self,
+        size: ModelSize,
+        prompts: list[str],
+        max_tokens: int = 128,
+        temperature: float = 0.7,
+    ) -> list[dict]:
+        """
+        Generate text from multiple prompts in a single batch.
+
+        Why batch?
+        - GPU has thousands of cores — a single small sequence uses <1%
+        - Running N sequences together fills the GPU → ~3-5x more tokens/sec
+        - The overhead of one forward pass vs N is minimal
+        - Cost per token drops significantly
+
+        The key: tokenization happens together, forward pass is one call,
+        decode is one call per sequence. GPU parallelism happens automatically.
+
+        Args:
+            size: Which model to use
+            prompts: List of input prompts
+            max_tokens: Max tokens per prompt
+            temperature: Sampling temperature
+
+        Returns:
+            List of result dicts, one per prompt
+        """
+        if not prompts:
+            return []
+
+        loaded = await self.ensure_model(size)
+        if not loaded:
+            raise RuntimeError(f"Failed to load model {size.value}")
+
+        model = self._models[size]
+        tokenizer = self._tokenizers[size]
+
+        metrics = self._metrics[size]
+        metrics.total_requests += len(prompts)
+
+        start_time = time.time()
+
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            executor := ThreadPoolExecutor(max_workers=1),
+            self._generate_batch_sync,
+            model, tokenizer, prompts, max_tokens, temperature
+        )
+        executor.shutdown(wait=False)
+
+        batch_latency_ms = (time.time() - start_time) * 1000
+        total_tokens = sum(r["completion_tokens"] for r in results)
+
+        metrics.total_latency_ms += batch_latency_ms
+        metrics.total_tokens_generated += total_tokens
+
+        if torch.cuda.is_available():
+            current_mem = torch.cuda.memory_allocated() / 1e6
+            metrics.peak_memory_mb = max(metrics.peak_memory_mb, current_mem)
+
+        for r in results:
+            r["latency_ms"] = batch_latency_ms  # latency is for whole batch
+
+        return results
+
+    @staticmethod
+    def _generate_batch_sync(
+        model,
+        tokenizer,
+        prompts: list[str],
+        max_tokens: int,
+        temperature: float,
+    ) -> list[dict]:
+        """
+        Synchronous batch inference — runs in thread pool.
+
+        Key insight: tokenizer(prompts) returns a batched batch of tensors.
+        model.generate(**inputs) processes ALL sequences in parallel.
+        tokenizer.batch_decode(outputs) decodes ALL sequences.
+        """
+        device = next(model.parameters()).device
+
+        # Tokenize all prompts together — creates padded batch
+        # padding=True ensures all sequences are same length
+        # truncation=True prevents OOM on very long prompts
+        inputs = tokenizer(
+            prompts,
+            padding=True,           # pad to longest in batch
+            truncation=True,        # don't exceed model's max length
+            max_length=2048,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        prompt_lengths = (inputs["attention_mask"]).sum(dim=1).tolist()
+
+        # Single forward pass for all sequences — GPU does them in parallel
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=temperature > 0,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                use_cache=True,
+            )
+
+        # Decode each sequence individually (can't batch decode efficiently)
+        results = []
+        for i, output in enumerate(outputs):
+            prompt_len = prompt_lengths[i]
+            completion_ids = output[prompt_len:]
+            completion_tokens = len(completion_ids)
+            text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+
+            results.append({
+                "text": text,
+                "prompt_tokens": prompt_len,
+                "completion_tokens": completion_tokens,
+            })
+
+        return results
+
     @staticmethod
     def _generate_sync(
         model,
@@ -345,6 +469,10 @@ class ModelPool:
             for size in ModelSize
         }
 
+    def get_queue_size(self, size: ModelSize) -> int:
+        """Return current size of the pending queue for a model."""
+        return self._pending_queue.get(size, 0)
+
     def unload_model(self, size: ModelSize):
         """Unload a model to free GPU memory."""
         if size in self._models and self._models[size] is not None:
@@ -354,6 +482,74 @@ class ModelPool:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print(f"  Unloaded {size.value} — freed GPU memory")
+
+    async def generate_stream(
+        self,
+        size: ModelSize,
+        prompt: str,
+        max_tokens: int = 128,
+        temperature: float = 0.7,
+    ):
+        """
+        Async generator that yields tokens as they're generated.
+
+        This enables streaming responses — the client sees tokens arrive
+        one by one rather than waiting for the full generation.
+
+        How it works:
+        1. Run model.generate() which produces all tokens at once
+        2. Yield each token as it's decoded
+        3. Client sees them appear incrementally
+
+        Note: Real streaming (no waiting) would require a custom generation loop
+        that yields after each token. HuggingFace's generate() returns all at once.
+        For production streaming, you'd implement the decode loop manually.
+        """
+        loaded = await self.ensure_model(size)
+        if not loaded:
+            raise RuntimeError(f"Failed to load model {size.value}")
+
+        model = self._models[size]
+        tokenizer = self._tokenizers[size]
+
+        loop = asyncio.get_event_loop()
+        tokens = await loop.run_in_executor(
+            executor := __import__("concurrent.futures").ThreadPoolExecutor(max_workers=1),
+            self._generate_stream_sync,
+            model, tokenizer, prompt, max_tokens, temperature
+        )
+        executor.shutdown(wait=False)
+
+        for token in tokens:
+            yield token
+
+    @staticmethod
+    def _generate_stream_sync(
+        model,
+        tokenizer,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+    ) -> list[str]:
+        """Synchronous token list generation — runs in thread pool."""
+        inputs = tokenizer(prompt, return_tensors="pt")
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        prompt_len = inputs["input_ids"].shape[1]
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=temperature > 0,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                use_cache=True,
+            )
+
+        generated_ids = outputs[0][prompt_len:]
+        tokens = tokenizer.convert_ids_to_tokens(generated_ids)
+        return tokens
 
 
 # =============================================================================
