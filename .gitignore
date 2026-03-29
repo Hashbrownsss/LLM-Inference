@@ -1,0 +1,67 @@
+# Models — these are downloaded, not written by us
+models/llm-inference/models/
+*.bin
+*.safetensors
+ggml-*.bin
+*.gguf
+
+# HuggingFace cache — massive, don't commit
+.cache/
+hf_cache/
+transformers_cache/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter notebooks — don't commit outputs
+*.ipynb
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# GPU profiling outputs
+*.ptx
+*.nsys
+*.nvprof
+
+# Benchmark results (optional — you may want to commit these)
+benchmarks/
+results/
+*.csv
+*.json
