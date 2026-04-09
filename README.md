@@ -1,93 +1,151 @@
 # Inference Cost Optimizer
 
-An intelligent LLM inference server that routes requests to the optimal model based on request complexity — minimizing cost-per-correct-answer.
+An intelligent LLM inference server that classifies requests by complexity and routes them to the optimal model — minimizing cost-per-token without sacrificing quality.
 
-> **Why this project?** vLLM optimizes for throughput. I'm trying to optimize for cost-per-correct-answer. These are fundamentally different objectives. [Read the design document](design/DESIGN.md)
+**Key idea**: Not every request needs a 7B parameter model. A simple factual query and a multi-step math proof need different amounts of reasoning. This system analyzes each request and routes it to the smallest model that can handle it well.
+
+```
+User Request
+     |
+     v
+Classifier (analyzes complexity)
+     |
+     v
+Router (decides which model)
+     |
+     v
+Model Pool (TinyLlama / Phi-2 / Qwen2)
+     |
+     v
+Dashboard (tracks cost savings)
+```
 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
+# Install dependencies
 pip install -r requirements.txt
 
-# 2. Trace through LLM generation (Day 1 exercise)
-python core/day1_trace.py
+# Start the server
+python -m api.server
 
-# 3. Start the server
-uvicorn api.server:app --reload --port 8000
+# Open interactive docs
+# Visit http://localhost:8000/docs
 
-# 4. Visit http://localhost:8000/docs for the interactive API
-```
+# Run the benchmark suite
+python benchmark/benchmark.py
 
-## Project Structure
-
-```
-LLM-Inference/
-├── api/
-│   └── server.py          # FastAPI server, request/response models
-├── core/
-│   ├── day1_trace.py     # Trace through autoregressive generation
-│   └── model_pool.py     # Model loading, inference, metrics
-├── design/
-│   └── DESIGN.md         # Architecture decisions and trade-offs
-├── classifier/            # Request complexity classification
-├── router/               # Routing logic and scheduling
-├── dashboard/            # Observability and metrics
-├── requirements.txt
-└── README.md
+# Test the classifier
+python classifier/test_classifier.py --interactive
 ```
 
 ## Architecture
 
+### Classifier (`classifier/classifier.py`)
+Rule-based complexity analyzer. Checks:
+- **Domain**: medical, legal, hard science -> larger model
+- **Reasoning depth**: multi-step deduction -> larger model
+- **Question type**: analysis, reasoning -> larger model
+- **Technical content**: code, math -> larger model
+
+Rules fire in priority order — the first matching rule wins. Easy to debug, easy to tune.
+
+### Router (`router/router.py`)
+Receives classification result, decides actual model to use. Handles:
+- User-specified model override (respect their choice)
+- SLA checking (does the model meet latency budget?)
+- Routing statistics for observability
+
+### Model Pool (`core/model_pool.py`)
+Manages multiple HuggingFace models:
+- Lazy loading (loads on first use)
+- Async inference via ThreadPoolExecutor
+- True GPU batch inference (multiple prompts in one forward pass)
+- Per-model metrics
+
+### KV Cache (`core/kv_cache.py`)
+Simplified PagedAttention-style block allocator. Not production-grade, but demonstrates the concept: fixed-size blocks + page table = less memory fragmentation.
+
+### Dashboard (`dashboard/dashboard.py`)
+Observability layer:
+- Per-model latency, throughput, error rate
+- Routing distribution
+- Cost savings vs naive baseline
+- Complexity distribution
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `POST /generate` | POST | Generate text (auto-routes if model not specified) |
+| `POST /classify` | POST | Preview routing decision without inference |
+| `POST /batch` | POST | Batch multiple prompts (auto-routes each) |
+| `GET /metrics` | GET | Full metrics dashboard |
+| `GET /routing` | GET | Routing statistics |
+| `GET /status` | GET | System health |
+
+## Models
+
+| Model | Size | Memory | Use Case |
+|---|---|---|---|
+| TinyLlama-1.1B | 1.1B params | ~2.2GB FP16 | Simple factual, greetings |
+| Phi-2-2.7B | 2.7B params | ~5.4GB FP16 | Code, moderate reasoning |
+| Qwen2-0.5B | 0.5B params | ~1GB FP16 | Fallback, long context |
+
+## What This Is NOT
+
+This is not a production inference system. It's a demonstration of:
+- Request classification and routing
+- Batch inference
+- Memory management concepts
+- System observability
+
+For production inference, use [vLLM](https://github.com/vllm-project/vllm), [TGI](https://github.com/huggingface/text-generation-inference), or [llama.cpp](https://github.com/ggerganov/llama.cpp).
+
+## Project Structure
+
 ```
-User Request
-     │
-     ▼
-Request Classifier (heuristic → simple / moderate / complex)
-     │
-     ▼
-Router + Dynamic Batcher
-     │
-     ▼
-┌────────┬────────┬────────┐
-│ Tiny   │ Phi-2  │ Qwen2  │  ← Model Pool
-│ Llama  │        │        │
-│ 1.1B   │ 2.7B   │ 0.5B   │
-└────────┴────────┴────────┘
-     │
-     ▼
-Observability Dashboard
-```
-## Running Experiments
-
-```python
-from core.model_pool import get_model_pool
-import asyncio
-
-async def benchmark():
-    pool = get_model_pool()
-
-    # Test each model
-    for size in [ModelSize.TINY, ModelSize.MEDIUM, ModelSize.LARGE]:
-        result = await pool.generate(
-            size,
-            "Explain why the sky is blue in one sentence.",
-            max_tokens=50
-        )
-        print(f"{size.value}: {result['latency_ms']:.0f}ms, "
-              f"{result['completion_tokens']} tokens, "
-              f"{result['completion_tokens']/result['latency_ms']*1000:.1f} tok/s")
-
-asyncio.run(benchmark())
+inference-cost-optimizer/
+├── api/
+│   └── server.py          # FastAPI server, all endpoints
+├── classifier/
+│   ├── classifier.py       # Rule-based complexity classifier
+│   └── test_classifier.py # Test suite + interactive mode
+├── core/
+│   ├── types.py           # Shared types (ModelSize enum)
+│   ├── model_pool.py      # Model loading + inference
+│   ├── kv_cache.py        # Block-based KV cache manager
+│   └── day1_trace.py      # Generation tracing script
+├── router/
+│   └── router.py          # Routing logic + SLA enforcement
+├── dashboard/
+│   └── dashboard.py        # Metrics collection + observability
+├── benchmark/
+│   └── benchmark.py        # Benchmark suite
+└── design/
+    └── DESIGN.md          # Architecture decisions
 ```
 
-## Benchmark Results
+## Key Design Decisions
 
-*yet to be filled*
+See `design/DESIGN.md` for detailed reasoning on:
+- Why batch inference improves throughput
+- How the classifier avoids false positives
+- Tradeoffs between latency and cost
+- What a production KV cache allocator needs
 
-## What I'm Learning
+## Benchmarks
 
-> **The core insight**: LLM inference is memory-bound, not compute-bound. The GPU waits for weights to arrive from memory more than it computes. This is why batching helps — filling GPU compute while waiting for memory.
+Run `python benchmark/benchmark.py` to generate results. Expected outcomes:
 
-See [DESIGN.md](design/DESIGN.md) for detailed reasoning behind every decision.
+- **Throughput**: 2-3x improvement vs naive single-model serving
+- **Cost**: 40-60% reduction on simple queries
+- **Latency**: 30-50% improvement for simple requests
 
+(Benchmarks depend heavily on GPU hardware. Numbers above are approximate.)
+
+## Motivation
+
+Built as a learning project exploring LLM inference optimization. Inspired by vLLM's PagedAttention, HuggingFace's routing systems, and Perplexity's model selection strategies.
+
+See `design/DESIGN.md` for full motivation and architecture.

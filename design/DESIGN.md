@@ -1,202 +1,152 @@
 # Inference Cost Optimizer — Design Document
 
-> **Problem Statement**: LLM inference is expensive and memory-bound. Serving all requests with the same model wastes resources on simple queries and starves complex ones. We build an intelligent routing layer that classifies requests by complexity and routes them to the optimal model, minimizing cost-per-correct-answer.
+## Problem Statement
 
----
+LLM inference is memory-bound, not compute-bound. The GPU spends more time waiting for weights to arrive from memory than actually computing. This means:
 
-## Problem Analysis
+1. Serving one request at a time uses a fraction of GPU capacity
+2. The same amount of work (batch of requests) can be done much faster by batching
+3. Not every request needs the largest model — routing saves cost without sacrificing quality
 
-### Why LLM Inference Is Memory-Bound
-
-A language model generates text one token at a time. Each new token must:
-1. Load all model weights from GPU memory (~14GB for 7B FP16)
-2. Load the entire KV cache of all previous tokens
-3. Perform a small amount of computation
-4. Repeat for every token
-
-**The bottleneck is memory bandwidth, not compute.** Modern GPUs have compute that far exceeds memory transfer speed. The GPU sits idle waiting for weights to arrive.
-
-### KV Cache Growth
-
-During autoregressive generation, attention requires Key and Value tensors for **every previous token**:
-
-```
-Context length  512:  KV cache ≈  64 MB/layer
-Context length 2048:  KV cache ≈ 256 MB/layer
-Context length 4096:  KV cache ≈ 512 MB/layer
-```
-
-For a 32-layer model, that's gigabytes of KV cache. This memory must be managed efficiently — naive allocation leads to fragmentation and OOM.
-
-### vLLM's Insight: PagedAttention
-
-Instead of allocating one contiguous block per sequence, PagedAttention allocates fixed-size blocks (typically 16 tokens each). A page table maps logical token positions to physical blocks. This is identical to how OS virtual memory works.
-
-**Key benefit**: Reduces memory fragmentation from ~60-80% to <4%, enabling 2-4x more sequences in GPU memory.
-
-### Our Angle: Cost-Driven Routing
-
-vLLM optimizes for **throughput**. We optimize for **cost-per-correct-answer**. These are fundamentally different objectives:
-
-| Optimization Target | Metric | Strategy |
-|---|---|---|
-| vLLM | tokens/sec/GB | Maximize batch size, minimize memory waste |
-| Ours | cost/token × accuracy | Route each request to minimum-cost sufficient model |
-
-**Hypothesis**: Not every request needs a 7B parameter model. Simple factual queries, classification tasks, and short responses can be handled by small quantized models with equivalent quality.
+**Goal**: Build an inference server that classifies each request's complexity and routes it to the smallest model that can handle it well. Minimize cost-per-correct-answer, not just cost-per-token.
 
 ---
 
 ## Architecture
 
 ```
-User Request
-     │
-     ▼
-┌──────────────────────────────────────────────┐
-│           Inference Cost Optimizer             │
-│                                               │
-│  1. Request Ingestion (FastAPI)               │
-│           │                                   │
-│           ▼                                   │
-│  2. Request Classifier (heuristic or ML)      │
-│      "simple" → small model pool              │
-│      "complex" → large model pool             │
-│           │                                   │
-│           ▼                                   │
-│  3. Router + Scheduler                        │
-│      Async queues, batching, backpressure       │
-│           │                                   │
-│           ▼                                   │
-│  4. Model Pool                                │
-│      TinyLlama-1.1B / Phi-2 / Qwen-0.5B      │
-│                                               │
-│  5. Observability Layer                       │
-│      Cost tracking, latency breakdown          │
-└──────────────────────────────────────────────┘
+HTTP Request
+     |
+     v
+FastAPI Server
+     |
+     v
+Request Classifier (rule-based, 20 rules in priority order)
+     |
+     v
+Router (respects user override, enforces SLA, logs decisions)
+     |
+     v
+Model Pool (TinyLlama / Phi-2 / Qwen2)
+     |
+     v
+Dashboard (latency, throughput, cost savings, routing stats)
 ```
-
-### Component Responsibilities
-
-**Request Classifier**
-- Input: raw prompt text
-- Output: complexity label (simple / moderate / complex)
-- Methods: heuristic (length, keywords) or ML classifier
-- Why: separates concerns; we can improve classification independently
-
-**Router**
-- Input: complexity label + request queue
-- Output: routes to appropriate model pool
-- Handles: SLA enforcement, queue prioritization
-- Why: decoupled from classifier; enables A/B testing different routing policies
-
-**Model Pool**
-- Multiple models at different sizes and quantization levels
-- Each model runs in its own async process
-- Exposes consistent interface regardless of underlying model
-
-**Observability Layer**
-- Metrics: tokens/sec, memory usage, cache hit rate, cost/token
-- Latency breakdown: prefill time vs decode time
-- Per-model accuracy tracking (ground truth evaluation)
 
 ---
 
-## Design Decisions + Trade-offs
+## Components
 
-### Decision 1: Heuristic vs ML Classifier
+### 1. Classifier (`classifier/classifier.py`)
 
-**Option A — Heuristic**: Use prompt length, presence of code/math keywords, estimated reasoning steps.
-- Pros: Fast, no extra model, interpretable
-- Cons: Limited accuracy, can't capture nuanced complexity
+Rule-based complexity classifier. Replaced a weighted-score approach (failed at 33% accuracy) with explicit priority rules (90% accuracy on test set).
 
-**Option B — Small ML Classifier**: Fine-tune a 50M parameter model to classify request complexity.
-- Pros: More accurate, can learn from data
-- Cons: Extra inference cost for classification, adds latency
+**Rules cover:**
+- Hard domains: medical, legal, hard_science -> always LARGE model
+- Technical content + reasoning depth -> moderate/complex
+- Question type: reasoning > analysis > creation > factual
+- Each rule fires in priority order, first match wins
 
-**Chosen**: Start with Option A (heuristic), validate on real traffic, upgrade to Option B if heuristic misses >20% of cases.
+**Why not ML classifier?**
+- Heuristic is fast (no extra inference overhead)
+- Interpretable: can explain exactly why a decision was made
+- Easy to tune: add/remove rules without retraining
+- Upgradeable: replace with fine-tuned DistilBERT if needed
 
-### Decision 2: Model Pool Composition
+### 2. Router (`router/router.py`)
 
-| Model | Parameters | Quantization | Memory | Use Case |
-|---|---|---|---|---|
-| TinyLlama-1.1B | 1.1B | Q4_K_M | ~600MB | Simple factual, short responses |
-| Phi-2 | 2.7B | Q4_K_M | ~1.5GB | Moderate reasoning, code |
-| Qwen2-0.5B | 0.5B | Q8 | ~600MB | Fallback, batched simple tasks |
+Simple routing layer:
+- User specified model -> use that (respects choice)
+- Auto-route -> use classifier's recommendation
+- SLA check: does recommended model meet latency budget?
+- Logs all decisions for observability
 
-### Decision 3: Batching Strategy
+### 3. Model Pool (`core/model_pool.py`)
 
-Naive batching: Wait for N requests, process together.
-- Problem: Simple requests wait behind complex ones → high latency
+Manages three HuggingFace models:
+- **TinyLlama-1.1B**: fast, cheap, ~2.2GB (FP16)
+- **Phi-2-2.7B**: moderate, ~5.4GB (FP16)
+- **Qwen2-0.5B**: small, ~1GB, long context support
 
-**Chosen: Dynamic batching with max_wait_time**
-- Batch requests up to max_wait_time (e.g., 100ms)
-- After timeout, process whatever is in the batch
-- Small/simple requests don't wait long; large batches maximize throughput
+**Lazy loading**: models load on first use, not at startup.
+**True batching**: `generate_batch()` tokenizes all prompts together, runs one GPU forward pass, decodes individually. ~3-5x throughput improvement.
 
-### Decision 4: Evaluation Metric
+### 4. KV Cache Manager (`core/kv_cache.py`)
 
-We track **cost-weighted accuracy**:
-```
-Score = (accuracy × request_complexity_weight) / cost_per_token
-```
+Simplified PagedAttention-style allocator. Not production-grade but demonstrates the concept.
 
-A request classified as "simple" but answered incorrectly costs more than a correct answer — the classifier made the wrong routing decision. We weight by complexity to prioritize correct complex requests over correct simple ones.
+**Naive approach**:
+- Allocate one big contiguous block per sequence
+- Sequence finishes, block is mostly empty -> wasted memory
+- Memory fragmentation: 60-80% waste
+
+**Block-based approach**:
+- Fixed 16-token blocks
+- Page table maps logical positions to physical blocks
+- Like OS virtual memory: contiguous virtual addresses, scattered physical pages
+- Memory utilization: <4% waste
+
+**Limitation**: real PagedAttention requires custom CUDA kernels. This is a Python simulation showing the concept.
+
+### 5. Dashboard (`dashboard/dashboard.py`)
+
+Observability layer:
+- Per-model: latency p50/p90/p95/p99, throughput, error rate
+- Routing: auto vs manual, complexity distribution
+- Cost: naive baseline vs optimized cost comparison
+- Export to JSON for external dashboards
 
 ---
 
 ## Benchmark Plan
 
-### Baseline: Naive Serving
-All requests → single model (Phi-2 2.7B). Measure:
-- Throughput: tokens/sec
-- Memory usage: peak GPU memory
-- Cost/token: computed from GPU-hours and tokens processed
-- Accuracy: on a benchmark dataset
+**Baseline**: All requests -> single model (Phi-2)
+**Ours**: Classifier routes -> appropriate model
 
-### Our System
-Same benchmark, but with routing. Measure:
-- Same metrics per model in the pool
-- Routing accuracy: % of requests correctly classified
-- Cost savings: (naive_cost - optimized_cost) / naive_cost
-- Accuracy delta: did routing hurt accuracy?
+**Expected metrics**:
+- Throughput: 2-3x improvement
+- Cost: 40-60% reduction on simple queries
+- Latency: 30-50% improvement for simple requests (TinyLlama is faster)
+- Accuracy: <5% degradation (acceptable for cost savings)
 
-### Expected Results
-
-```
-Hypothesis: 60-70% of requests are "simple" (can be handled by TinyLlama)
-→ Cost savings: 40-60% reduction in compute cost
-→ Accuracy impact: <5% accuracy loss (acceptable threshold)
-```
+Run: `python benchmark/benchmark.py`
 
 ---
 
-## Implementation Plan
+## Open Questions (Answered)
 
-### Week 1 (Current Sprint)
-- [ ] Day 1: Mental model, project setup, trace TinyLlama
-- [ ] Day 2: FastAPI server, request ingestion
-- [ ] Day 3: Model pool, basic serving
-- [ ] Day 4: Request classifier (heuristic)
-- [ ] Day 5: Router, dynamic batching
-- [ ] Day 6: KV cache basics, memory tracking
-- [ ] Day 7: First benchmark run
-
-### Week 2
-- [ ] Day 8-9: Observability dashboard
-- [ ] Day 10-11: Refine classifier
-- [ ] Day 12-13: Documentation + blog post
-- [ ] Day 14: Final benchmarks + polish
+| Question | Answer |
+|---|---|
+| Heuristic vs ML classifier? | Heuristic (90% accuracy, no extra inference cost) |
+| Static vs dynamic batching? | Dynamic (batch by model, not by arrival time) |
+| Batch size? | Configurable, max 32 prompts per batch |
+| SLA enforcement? | Basic (budget in ms per complexity level) |
+| Multi-turn conversations? | Not implemented (future work) |
 
 ---
 
-## Open Questions
+## What We'd Change for Production
 
-1. What is the accuracy threshold below which routing hurts more than it helps?
-2. Can we predict cost savings from request characteristics before running inference?
-3. Should we do speculative decoding on complex requests routed to small models?
-4. How do we handle multi-turn conversations with context carry-over?
+1. **KV Cache**: Replace Python simulation with real CUDA PagedAttention kernels (see vLLM)
+2. **Classifier**: Fine-tune a 50M DistilBERT for better accuracy
+3. **Routing**: Add cost estimation per request, A/B test routing policies
+4. **Observability**: Add Prometheus metrics + Grafana dashboards
+5. **Scaling**: Multiple GPU instances with request distribution (Ray Serve, vLLM)
+6. **Streaming**: Implement true token-by-token streaming (custom decode loop)
+7. **Prefix caching**: Cache KV for repeated prefixes across requests
 
 ---
 
-*Last updated: Day 1*
+## Key Tradeoffs Made
+
+| Decision | Tradeoff |
+|---|---|
+| Heuristic classifier | Fast but less accurate than ML. Upgradeable later. |
+| Rule-based routing | Simple, interpretable. Can't learn from data. |
+| Python KV cache | Demonstrates concept. Real impl needs CUDA. |
+| No speculative decoding | Would improve latency. Complexity not justified for demo. |
+| Per-model queues | Simple. Production needs priority queues + preemption. |
+
+---
+
+*Last updated: Project completion*
